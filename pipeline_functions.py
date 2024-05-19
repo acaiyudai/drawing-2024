@@ -256,7 +256,7 @@ class PipelineFunctions():
     # 隣合う座標どうしのコサイン類似度が高い線分の組み合わせを見つけ
     # その線分を連結させている座標を優先的に取り除く
     # 一斉に取り除くアルゴリズム
-    def get_downsampled_coord_by_cossim(x, y, sample_size):
+    def get_downsampled_coord_by_cossim(self, x, y, sample_size):
         # コサイン類似度を計算する
         def calc_cos_sim(v1, v2):
             if (np.linalg.norm(v1) * np.linalg.norm(v2)) == 0:
@@ -411,7 +411,9 @@ class PipelineFunctions():
             cos_sims_list.append(cos_sims)
             
         return cos_sims_list
-
+    
+    def get_minmax_scaled_data(self, data):
+        return [(val - min(data)) / (max(data) - min(data)) for val in data]
     # ===== 特徴量抽出処理 ここまで ===== #
     
 def main():    

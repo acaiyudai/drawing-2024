@@ -6,7 +6,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.offsetbox import OffsetImage, AnnotationBbox 
 
-class ViewFunction():    
+class ViewFunctions():    
     def __init__(self):
         self.DF_HTML_PATH = r'../temp/dataframe.html'
     
