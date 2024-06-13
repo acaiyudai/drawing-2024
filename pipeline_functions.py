@@ -1,6 +1,8 @@
 import numpy as np
 import pandas as pd
 import math
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler
 # 有効桁数統一用 #
 import sigfig
 from decimal import *
@@ -24,8 +26,8 @@ class PipelineFunctions():
     
     # ===== 必須処理 ここから ===== #
     # tsvファイルの読み込み(tsvファイルへのパス)
-    def read_tsv(self, path):
-        return pd.read_csv(path, delimiter='\t', index_col=0)
+    def read_tsv(self, tsv_path):
+        return pd.read_csv(tsv_path, delimiter='\t', index_col=0)
     
     # tsvファイルに文字列で格納された座標をリストに変換する(対象df)
     def conv_str_to_coord(self, df):
@@ -179,20 +181,32 @@ class PipelineFunctions():
         return df
     
     # 必須処理をまとめて行う
-    def get_normalized_data(self, path, rotate_type):
-        org_df = self.read_tsv(path)
+    def get_normalized_data(self, tsv_path, rotate_type):
+        org_df = self.read_tsv(tsv_path)
         conv_str_df = self.conv_str_to_coord(org_df)
         rm_overlap_df = self.remove_overlap_coord(conv_str_df)
         rotated_df = self.rotate_coord(rm_overlap_df, rotate_type)
         size_unified_df = self.unify_stroke_size(rotated_df)
-        return size_unified_df
+        
+        rename_df = pd.DataFrame({
+            'drawing_id': size_unified_df['drawing_id'],
+            'stroke_id': size_unified_df['stroke_id'],
+            'shape_int': size_unified_df['shape_int'],
+            'pt_cnt': [len(coord) for coord in size_unified_df['rotated_x']],
+            'rotated_x': size_unified_df['rotated_x'],
+            'rotated_y': size_unified_df['rotated_y'],
+            'normalized_x': size_unified_df['size_unified_x'],
+            'normalized_y': size_unified_df['size_unified_y']
+        })
+        
+        return rename_df
     
     # 有効桁数を統一する(有効桁数を統一したいリスト)
     def unify_sigdig(self, l, sigdig):
         return [round(val, sigdig) for val in l]
     # ===== 必須処理 ここまで ===== #
     
-    # ===== 特徴量抽出処理 ここから ===== #
+    # ===== 特徴点抽出処理 ここから ===== #
     
     # ストローク外包矩形が3mm × 3mm以下の線を「点」として取り除く
     def remove_3x3area(self, df):
@@ -203,8 +217,11 @@ class PipelineFunctions():
             _is_in_3x3area = 1 if x_range <= 3 and y_range <=3 else 0
             return _is_in_3x3area
         
-        df['is_in_3x3area'] = [is_in_3x3area(x, y) for x, y in zip(df['rotated_x'], df['rotated_y'])]
-        return df.query('is_in_3x3area == 0')
+        copy_df = df.copy()
+        copy_df['is_in_3x3area'] = [is_in_3x3area(x, y) for x, y in zip(df['rotated_x'], df['rotated_y'])]
+        df_rm_3x3area = copy_df.query('is_in_3x3area == 0').reset_index()
+        
+        return df_rm_3x3area
     
     # 既存の線種判定で「点」ラベルが付いたストロークを取り除く
     def remove_point(df):
@@ -394,27 +411,177 @@ class PipelineFunctions():
         
         return  sampled_xs, sampled_ys, unit_vec_xs, unit_vec_ys
     
-    # コサイン類似度を計算する(対象リスト)
-    def get_cossim(self, xs, ys):
+    # 指定した数の特徴点を抽出する
+    def sample_essential_point(self, df, sample_size):
+        df_org = df.copy()
+        # --- 特徴点抽出方法1 --- #
+        # 座票数が指定した数より小さい場合：線分の中点に点を埋める
+        # 座票数が指定した数と同じ場合：そのまま
+        # 座票数が指定した数より大きい場合：線分間のコサイン類似度が最も高い箇所から座標を取り除く
+        smaller_cossim_x = []
+        smaller_cossim_y = []
+        for i, row in df.iterrows():
+            if row['pt_cnt'] < sample_size:
+                over_x, over_y = self.get_oversampled_coord(row['normalized_x'], row['normalized_y'], sample_size)
+                smaller_cossim_x.append(over_x)
+                smaller_cossim_y.append(over_y)      
+            elif row['pt_cnt'] == sample_size:
+                smaller_cossim_x.append(row['normalized_x'])
+                smaller_cossim_y.append(row['normalized_y'])
+            else:
+                down_x, down_y = self.get_downsampled_coord_by_cossim_sequentially(row['normalized_x'], row['normalized_y'], sample_size)
+                smaller_cossim_x.append(down_x)
+                smaller_cossim_y.append(down_y)
+        
+        # --- 特徴点抽出方法2 --- #
+        # 長さで等間隔に抽出する
+        equal_interval_x = [self.get_sampled_coord_vector_by_length(x, y, sample_size)[0] for x, y in zip(df['normalized_x'], df['normalized_y'])]
+        equal_interval_y = [self.get_sampled_coord_vector_by_length(x, y, sample_size)[1] for x, y in zip(df['normalized_x'], df['normalized_y'])]
+        equal_interval_vecx = [self.get_sampled_coord_vector_by_length(x, y, sample_size)[2] for x, y in zip(df['normalized_x'], df['normalized_y'])]
+        equal_interval_vecy = [self.get_sampled_coord_vector_by_length(x, y, sample_size)[3] for x, y in zip(df['normalized_x'], df['normalized_y'])]
+        
+        # --- 元のdfと特徴点のdfを結合する --- #
+        essential_pt = pd.DataFrame({
+            'equal_interval_x': equal_interval_x,
+            'equal_interval_y': equal_interval_y,
+            'equal_interval_vecx': equal_interval_vecx,
+            'equal_interval_vecy': equal_interval_vecy,
+            'smaller_cossim_x': smaller_cossim_x,
+            'smaller_cossim_y': smaller_cossim_y,
+        })
+        
+        org_plus_essential_pt = pd.concat([df_org, essential_pt], axis=1)
+        
+        return org_plus_essential_pt
+     
+    # ===== 特徴点抽出処理 ここまで ===== #
+    
+    # ===== 特徴量抽出処理 ここから ===== #
+    # 特徴点のxy軸を結合
+    def calc_org_coord(self, x, y):
+        return x + y
+
+    # 隣接する特徴点間のベクトルを結合
+    def calc_segment_vec(self, x, y):
+        return [x[i]-x[i-1] for i in range(1, len(x))] + [y[i]-y[i-1] for i in range(1, len(x))]
+
+    # 隣接する特徴点間のベクトルどうしのコサイン類似度
+    def calc_segment_cossim(self, x, y):
         def calc_cos_sim(v1, v2):
             if (np.linalg.norm(v1) * np.linalg.norm(v2)) == 0:
-                print('------------ exception -------------')
-            return np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
-        
-        vectors_list = []
-        cos_sims_list = []
+                print('------------ exception segment -------------')
+                return 1
+            else:
+                return np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+        cos_sim = [calc_cos_sim(np.array([x[i]-x[i-1], y[i]-y[i-1]]), 
+                                np.array([x[i-1]-x[i-2], y[i-1]-y[i-2]])) for i in range(2, len(x))]
+        return cos_sim
 
-        for x, y in zip(xs, ys):
-            vectors = [np.array([x[i] - x[i-1], y[i] - y[i-1]]) for i in range(1, len(x))]
-            vectors_list.append(vectors)
-            cos_sims = [calc_cos_sim(vectors[i], vectors[i-1]) for i in range(1, len(vectors))]
-            cos_sims_list.append(cos_sims)
-            
-        return cos_sims_list
+    # 隣接する特徴点間のベクトルと始点終点間ベクトルのコサイン類似度
+    def calc_startend_seg_cossim(self, x, y):
+        def calc_cos_sim(v1, v2):
+            if (np.linalg.norm(v1) * np.linalg.norm(v2)) == 0:
+                print('------------ exception startend -------------')
+                return 1
+            else:
+                return np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+        startend_vec = np.array([x[-1] - x[0], y[-1] - y[0]])
+        vec_x = [x[i]-x[i-1] for i in range(1, len(x))]
+        vec_y = [y[i]-y[i-1] for i in range(1, len(y))]
+        cos_sim = [calc_cos_sim(startend_vec, np.array([vecx, vecy])) for vecx, vecy in zip(vec_x, vec_y)]
+        return cos_sim
+
+    # 点上での勾配ベクトルと始点終点間ベクトルのコサイン類似度
+    def calc_startend_grad_cossim(self, x, y, grad_x, grad_y):
+        def calc_cos_sim(v1, v2):
+            if (np.linalg.norm(v1) * np.linalg.norm(v2)) == 0:
+                print('------------ exception gradient-------------')
+                return 1
+            else:
+                return np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+        startend_vec = np.array([x[-1] - x[0], y[-1] - y[0]])
+        cos_sim = [calc_cos_sim(startend_vec, np.array([vec_x, vec_y])) for vec_x, vec_y in zip(grad_x, grad_y)]
+        return cos_sim
+
+    # 隣接する勾配ベクトルどうしのコサイン類似度
+    def calc_segment_grad_cossim(self, grad_x, grad_y):
+        def calc_cos_sim(v1, v2):
+            if (np.linalg.norm(v1) * np.linalg.norm(v2)) == 0:
+                print('------------ exception segment -------------')
+                return 1
+            else:
+                return np.dot(v1, v2) / (np.linalg.norm(v1) * np.linalg.norm(v2))
+        cos_sim = [calc_cos_sim(np.array([grad_x[i-1], grad_y[i-1]]), 
+                                np.array([grad_x[i], grad_y[i]])) for i in range(1, len(grad_x))]
+        return cos_sim
     
-    def get_minmax_scaled_data(self, data):
-        return [(val - min(data)) / (max(data) - min(data)) for val in data]
+    # 上から4つの特徴量をまとめて導出して列に格納する
+    # 引数のsample_typeは，'smaller_cossim'か'equal_interval'
+    # 引数のsample_sizeは，3以上の自然数
+    def calc_all_feature(self, df, sample_type, sample_size):
+        df_org = df.copy()
+        org_coord = [self.calc_org_coord(x, y) for x, y in zip(df[f'{sample_type}_x'], df[f'{sample_type}_y'])]
+        segment_vec  = [self.calc_segment_vec(x, y) for x, y in zip(df[f'{sample_type}_x'], df[f'{sample_type}_y'])]
+        segment_cossim  = [self.calc_segment_cossim(x, y) for x, y in zip(df[f'{sample_type}_x'], df[f'{sample_type}_y'])]
+        startend_seg_cossim = [self.calc_startend_seg_cossim(x, y) for x, y in zip(df[f'{sample_type}_x'], df[f'{sample_type}_y'])]
+        feature = pd.DataFrame({
+            'org_coord': org_coord,
+            'segment_vec': segment_vec,
+            'segment_cossim': segment_cossim,
+            'startend_seg_cossim': startend_seg_cossim
+        })
+        
+        df_plus_feature = pd.concat([df_org, feature], axis=1)
+        return df_plus_feature
+    
     # ===== 特徴量抽出処理 ここまで ===== #
+    
+    # tsvファイルの読み込み，前処理，特徴点の抽出，特徴量の導出を一括で行う
+    def get_pipelined_data(self, tsv_path, rotate_type, sample_type, sample_size):
+        norm_data = self.get_normalized_data(tsv_path, rotate_type)
+        # remove_3x3area = self.remove_3x3area(norm_data)
+        essential_pt = self.sample_essential_point(norm_data, sample_size)
+        all_feature = self.calc_all_feature(essential_pt, sample_type, sample_size)
+        return all_feature
+    
+    # 指定した特徴量のみのdfを作成する
+    # 引数はget_pipelined_data()で生成したdfと入力したい特徴量名(feature_name)
+    def get_only_pipelined_feature(self, df, feature_name):
+        org_df = df.copy()
+        only_feature_dict = {}
+        for i in range(len(org_df[feature_name].iloc[-1])):
+            only_feature_dict[f'feature_{i}'] = [vals[i] for vals in org_df[feature_name]]
+        only_feature = pd.DataFrame(only_feature_dict)
+        return only_feature
+    
+    # 学習データのscalerで正規化を行う
+    def scale_minmax(self, only_feature, sample_type, sample_size, feature_name):
+        TRAIN_TEST_SPLIT_SEED = 1
+        TRAIN_TEST_SPLIT_COL = 'is_good_saito'
+        norm_feature = only_feature.copy()
+        
+        # ラベル付きデータを読み込む
+        ground_truth = pd.read_pickle('../data/shape_groundtruth_data.pkl').reset_index()
+        
+        # 学習データとテストデータを725:310に分割する
+        X = ground_truth.copy()
+        y = ground_truth[TRAIN_TEST_SPLIT_COL]
+        train_valid, test, y_train_valid, y_test = train_test_split(X, y, train_size=725, shuffle=True, stratify=y, random_state=TRAIN_TEST_SPLIT_SEED)
+        
+        # 学習データのみを加工する
+        train_valid_reset_index = train_valid.reset_index()
+        essential_pt = self.sample_essential_point(train_valid_reset_index, sample_size)
+        all_feature = self.calc_all_feature(essential_pt, sample_type, sample_size)
+        input_groundtruth_feature = self.get_only_pipelined_feature(all_feature, feature_name)
+        
+        # 最大最小scalerの作成
+        ### 学習データのスケーリング(正規化, 学習データのmin, maxを検証データとテストデータに適用) ###
+        scaler = MinMaxScaler()
+        for col in input_groundtruth_feature:
+            train_minmax_scaler = scaler.fit(input_groundtruth_feature[[col]])
+            norm_feature[f'norm_{col}'] = scaler.transform(norm_feature[[col]])
+            del norm_feature[col]
+        return norm_feature
     
 def main():    
     return
